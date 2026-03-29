@@ -194,6 +194,10 @@ class AutomationSelectorsConfig(BaseModel):
         "css:input#email-input",
         "css:input[name='loginHint']",
         "css:input[jsname='YPqjbf']",
+        "css:input[aria-label*='工作电子邮件地址' i]",
+        "css:input[placeholder*='工作电子邮件地址' i]",
+        "css:input[aria-label*='work email' i]",
+        "css:input[placeholder*='work email' i]",
         "css:input[type='email']",
         "css:input[autocomplete='username']",
         "css:input[name='identifier']",
@@ -203,8 +207,13 @@ class AutomationSelectorsConfig(BaseModel):
         "css:button#log-in-button",
         "css:button[jsname='jXw9Fb']",
         "css:button[aria-label='使用邮箱继续']",
+        "css:button[aria-label='继续']",
     ], description="邮箱提交按钮优先选择器")
     email_submit_button_keywords: List[str] = Field(default_factory=lambda: [
+        "继续",
+        "continue",
+        "下一步",
+        "next",
         "使用邮箱继续",
         "使用邮箱登录",
         "通过电子邮件登录",
@@ -213,9 +222,6 @@ class AutomationSelectorsConfig(BaseModel):
         "sign in with email",
         "use email",
         "continue with email",
-        "next",
-        "继续",
-        "下一步",
     ], description="邮箱提交按钮关键词")
     generic_clickable_selectors: List[str] = Field(default_factory=lambda: [
         "tag:button",

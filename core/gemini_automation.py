@@ -411,9 +411,9 @@ class GeminiAutomation:
         except Exception as e:
             self._log("warning", f"⚠️ Cookie 设置失败: {e}")
 
-        # Step 1.5: 按配置选择邮箱提交方式（默认页面输入）
+        # Step 1.5: 按流程选择邮箱提交方式（注册强制页面输入）
         from core.config import config
-        use_url_submit = bool(getattr(config.basic, "auth_use_url_submit", True))
+        use_url_submit = self._should_use_url_submit(is_new_account=is_new_account)
         self._auth_use_url_submit = use_url_submit
         login_hint = quote(email, safe="")
         login_url = f"https://auth.business.gemini.google/login/email?continueUrl=https%3A%2F%2Fbusiness.gemini.google%2F&loginHint={login_hint}&xsrfToken={xsrf_token}"
@@ -452,6 +452,38 @@ class GeminiAutomation:
         current_url = page.url
         self._log("info", f"📍 当前 URL: {current_url}")
 
+        post_email_step = "unknown"
+        code_input = None
+        if not use_url_submit:
+            post_email_step = self._wait_for_post_email_step(page, timeout=15 if is_new_account else 12)
+            self._log("info", f"📍 邮箱提交后状态: {post_email_step}")
+
+            if post_email_step == "signin-error":
+                self._save_screenshot(page, "signin_error")
+                if is_new_account:
+                    self._log("error", "❌ 注册失败，电子邮件可能不被接受")
+                    return {"success": False, "error": "注册失败，电子邮件可能不被接受"}
+                self._log("error", "❌ 进入 signin-error 页面，可能是代理或网络问题")
+                return {"success": False, "error": "signin-error: token rejected by Google, try changing proxy"}
+
+            if post_email_step == "business-ready":
+                self._log("info", "✅ 已登录，提取配置")
+                return self._extract_config(page, email)
+
+            if post_email_step == "verify-oob-code":
+                code_input = self._wait_for_code_input(page)
+                if not code_input:
+                    self._log("error", "❌ 验证码输入框未出现")
+                    self._save_screenshot(page, "code_input_missing")
+                    return {"success": False, "error": "code input not found"}
+            elif is_new_account:
+                self._log("error", "❌ 页面输入邮箱后未进入验证码页面")
+                self._save_screenshot(page, "registration_email_step_unexpected")
+                return {"success": False, "error": "registration email submit did not reach verification page"}
+
+            current_url = page.url
+            self._log("info", f"📍 邮箱提交后 URL: {current_url}")
+
         # 检测 signin-error 页面（极端情况，一般 URL 方式不会触发）
         if "signin-error" in current_url:
             self._log("error", "❌ 进入 signin-error 页面，可能是代理或网络问题")
@@ -469,106 +501,59 @@ class GeminiAutomation:
         if access_error:
             return access_error
 
-        # Step 3: 点击发送验证码按钮（最多5轮，适度退避间隔）
-        self._log("info", "📧 发送验证码...")
-        max_send_rounds = 5
-        send_round_delays = [10, 10, 15, 15, 20]
-        send_round = 0
-        while True:
-            send_round += 1
-            if self._click_send_code_button(page):
-                break
-            if self._last_send_error in ("send_ui_retry_later", "send_ui_alt_login_required"):
-                self._log("error", "❌ 页面提示“出了点问题/选择其他登录方法”，直接终止本次注册")
-                self._save_screenshot(page, "send_code_ui_blocked")
-                return {"success": False, "error": f"send code blocked by ui message: {self._last_send_error}"}
-            if send_round >= max_send_rounds:
-                self._log("error", "❌ 验证码发送失败（可能触发风控），建议更换代理IP")
-                self._save_screenshot(page, "send_code_button_failed")
-                return {"success": False, "error": "send code failed after retries"}
-            delay = send_round_delays[min(send_round - 1, len(send_round_delays) - 1)]
-            self._log("warning", f"⚠️ 发送失败，{delay}秒后重试 ({send_round}/{max_send_rounds})")
-            time.sleep(delay)
-
-        # Step 4: 等待验证码输入框出现
-        code_input = self._wait_for_code_input(page)
+        # Step 3: 如仍未进入验证码页，则走旧的发送验证码按钮逻辑
         if not code_input:
-            self._log("error", "❌ 验证码输入框未出现")
-            self._save_screenshot(page, "code_input_missing")
-            return {"success": False, "error": "code input not found"}
+            self._log("info", "📧 发送验证码...")
+            max_send_rounds = 5
+            send_round_delays = [10, 10, 15, 15, 20]
+            send_round = 0
+            while True:
+                send_round += 1
+                if self._click_send_code_button(page):
+                    break
+                if self._last_send_error in ("send_ui_retry_later", "send_ui_alt_login_required"):
+                    self._log("error", "❌ 页面提示“出了点问题/选择其他登录方法”，直接终止本次注册")
+                    self._save_screenshot(page, "send_code_ui_blocked")
+                    return {"success": False, "error": f"send code blocked by ui message: {self._last_send_error}"}
+                if send_round >= max_send_rounds:
+                    self._log("error", "❌ 验证码发送失败（可能触发风控），建议更换代理IP")
+                    self._save_screenshot(page, "send_code_button_failed")
+                    return {"success": False, "error": "send code failed after retries"}
+                delay = send_round_delays[min(send_round - 1, len(send_round_delays) - 1)]
+                self._log("warning", f"⚠️ 发送失败，{delay}秒后重试 ({send_round}/{max_send_rounds})")
+                time.sleep(delay)
 
-        # Step 5: 轮询邮件获取验证码（3次，每次5秒间隔）
+            # Step 4: 等待验证码输入框出现
+            code_input = self._wait_for_code_input(page)
+            if not code_input:
+                self._log("error", "❌ 验证码输入框未出现")
+                self._save_screenshot(page, "code_input_missing")
+                return {"success": False, "error": "code input not found"}
+
+        # Step 5: 轮询邮件获取验证码
         self._log("info", "📬 等待邮箱验证码...")
         poll_since_time = task_start_time - timedelta(seconds=30)
-        # 邮件投递存在一定延迟：未确认发送成功时，给更长首轮等待窗口，降低误判超时概率
-        first_timeout = 30 if self._last_send_confidence == "confirmed" else 35
-        self._log("info", f"📬 等待邮箱验证码 (窗口 {first_timeout}s, 发送状态={self._last_send_confidence})")
-        code = mail_client.poll_for_code(timeout=first_timeout, interval=5, since_time=poll_since_time)
+        code = self._poll_for_verification_code(page, mail_client, poll_since_time)
 
         if not code:
             resend_attempts = int(getattr(config.retry, "verification_code_resend_count", 2) or 0)
             resend_attempts = max(0, min(5, resend_attempts))
+            if self._last_send_error in ("send_ui_retry_later", "send_ui_alt_login_required"):
+                self._log("error", "❌ 重发时页面提示“出了点问题/选择其他登录方法”，直接失败")
+                self._save_screenshot(page, "resend_code_ui_blocked")
+                return {"success": False, "error": f"resend blocked by ui message: {self._last_send_error}"}
             if resend_attempts <= 0:
                 self._log("error", "❌ 验证码超时且未启用重发")
                 self._save_screenshot(page, "code_timeout")
                 return {"success": False, "error": "verification code timeout"}
-
-            for resend_index in range(1, resend_attempts + 1):
-                self._log("warning", f"⚠️ 验证码超时，尝试第 {resend_index}/{resend_attempts} 次重发...")
-                time.sleep(random.uniform(1.0, 2.0))
-
-                if not self._click_resend_code_button(page):
-                    if self._last_send_error in ("send_ui_retry_later", "send_ui_alt_login_required"):
-                        self._log("error", "❌ 重发时页面提示“出了点问题/选择其他登录方法”，直接失败")
-                        self._save_screenshot(page, "resend_code_ui_blocked")
-                        return {"success": False, "error": f"resend blocked by ui message: {self._last_send_error}"}
-                    self._log("warning", f"⚠️ 未找到重发按钮 ({resend_index}/{resend_attempts})，继续等待邮箱")
-                    fallback_timeout = 20 if self._last_send_confidence == "confirmed" else 25
-                    code = mail_client.poll_for_code(timeout=fallback_timeout, interval=5, since_time=poll_since_time)
-                    if code:
-                        break
-                    continue
-
-                resend_timeout = 25 if self._last_send_confidence == "confirmed" else 15
-                self._log("info", f"📬 已执行重发，继续轮询 (窗口 {resend_timeout}s, 发送状态={self._last_send_confidence}, 第 {resend_index} 次重发)")
-                code = mail_client.poll_for_code(timeout=resend_timeout, interval=5, since_time=poll_since_time)
-                if code:
-                    break
-
-            if not code:
-                self._log("error", "❌ 多次重发后仍未收到验证码")
-                self._save_screenshot(page, "code_timeout_after_resend")
-                return {"success": False, "error": "verification code timeout after resend retries"}
+            self._log("error", "❌ 多次重发后仍未收到验证码")
+            self._save_screenshot(page, "code_timeout_after_resend")
+            return {"success": False, "error": "verification code timeout after resend retries"}
         self._log("info", f"✅ 收到验证码: {code}")
 
         # Step 6: 输入验证码并提交
-        code_input = page.ele("css:input[jsname='ovqh0b']", timeout=3) or \
-                     page.ele("css:input[type='tel']", timeout=2)
-
-        if not code_input:
-            self._log("error", "❌ 验证码输入框已失效")
-            return {"success": False, "error": "code input expired"}
-
-        # 尝试模拟人类输入，失败则降级到直接注入
-        self._log("info", "⌨️ 输入验证码...")
-        if not self._simulate_human_input(code_input, code):
-            self._log("warning", "⚠️ 模拟输入失败，降级为直接输入")
-            code_input.input(code, clear=True)
-            time.sleep(random.uniform(0.4, 0.8))
-
-        # 提交验证码：先回车，再找验证按钮兜底
-        self._log("info", "⏎ 提交验证码")
-        code_input.input("\n")
-        time.sleep(random.uniform(1, 2))
-        # 如果回车没触发，找验证按钮点击
-        if "verify-oob-code" in page.url:
-            verify_btn = self._find_verify_button(page)
-            if verify_btn:
-                try:
-                    verify_btn.click()
-                    self._log("info", "✅ 已点击验证按钮（兜底）")
-                except Exception:
-                    pass
+        if not self._submit_verification_code(page, code):
+            return {"success": False, "error": "verification code submission failed"}
 
         # [注册专用] 验证码提交后先等几秒让页面跳转，再检查 403
         if is_new_account:
@@ -657,18 +642,127 @@ class GeminiAutomation:
         except Exception as e:
             self._log("warning", f"⚠️ 代理探测失败: {e}")
 
+    def _should_use_url_submit(self, is_new_account: bool = False) -> bool:
+        """注册流程强制使用页面输入，登录刷新仍可按配置走 URL 提交。"""
+        if is_new_account:
+            return False
+        try:
+            from core.config import config
+            return bool(getattr(config.basic, "auth_use_url_submit", True))
+        except Exception:
+            return True
+
+    def _wait_for_post_email_step(self, page, timeout: int = 20) -> str:
+        """等待邮箱提交后的下一步页面状态。"""
+        for _ in range(max(1, int(timeout))):
+            current_url = page.url or ""
+            if "signin-error" in current_url:
+                return "signin-error"
+            if "verify-oob-code" in current_url:
+                return "verify-oob-code"
+            if "business.gemini.google" in current_url and "csesidx=" in current_url and "/cid/" in current_url:
+                return "business-ready"
+            if self._find_code_input(page, timeout_primary=1, timeout_secondary=1):
+                return "verify-oob-code"
+            time.sleep(1)
+        return "timeout"
+
+    def _poll_for_verification_code(self, page, mail_client, poll_since_time):
+        """轮询验证码，超时后按配置执行页面内重发。"""
+        from core.config import config
+
+        first_timeout = 30 if self._last_send_confidence == "confirmed" else 35
+        self._log("info", f"📬 等待邮箱验证码 (窗口 {first_timeout}s, 发送状态={self._last_send_confidence})")
+        code = mail_client.poll_for_code(timeout=first_timeout, interval=5, since_time=poll_since_time)
+        if code:
+            return code
+
+        resend_attempts = int(getattr(config.retry, "verification_code_resend_count", 2) or 0)
+        resend_attempts = max(0, min(5, resend_attempts))
+        if resend_attempts <= 0:
+            return None
+
+        for resend_index in range(1, resend_attempts + 1):
+            self._log("warning", f"⚠️ 验证码超时，尝试第 {resend_index}/{resend_attempts} 次重发...")
+            time.sleep(random.uniform(1.0, 2.0))
+
+            if not self._click_resend_code_button(page):
+                if self._last_send_error in ("send_ui_retry_later", "send_ui_alt_login_required"):
+                    return None
+                self._log("warning", f"⚠️ 未找到重发按钮 ({resend_index}/{resend_attempts})，继续等待邮箱")
+                fallback_timeout = 20 if self._last_send_confidence == "confirmed" else 25
+                code = mail_client.poll_for_code(timeout=fallback_timeout, interval=5, since_time=poll_since_time)
+                if code:
+                    return code
+                continue
+
+            resend_timeout = 25 if self._last_send_confidence == "confirmed" else 15
+            self._log("info", f"📬 已执行重发，继续轮询 (窗口 {resend_timeout}s, 发送状态={self._last_send_confidence}, 第 {resend_index} 次重发)")
+            code = mail_client.poll_for_code(timeout=resend_timeout, interval=5, since_time=poll_since_time)
+            if code:
+                return code
+
+        return None
+
+    def _submit_verification_code(self, page, code: str) -> bool:
+        """输入验证码并优先点击“验证”按钮。"""
+        code_input = self._find_code_input(page, timeout_primary=3, timeout_secondary=2)
+        if not code_input:
+            self._log("error", "❌ 验证码输入框已失效")
+            return False
+
+        self._log("info", "⌨️ 输入验证码...")
+        try:
+            code_input.click()
+        except Exception:
+            pass
+
+        try:
+            code_input.input(code, clear=True)
+        except Exception:
+            if not self._simulate_human_input(code_input, code):
+                self._log("error", "❌ 验证码输入失败")
+                return False
+
+        time.sleep(random.uniform(0.4, 0.8))
+
+        self._log("info", "⏎ 点击验证按钮")
+        verify_btn = self._find_verify_button(page)
+        if verify_btn:
+            try:
+                self._human_click(page, verify_btn)
+                return True
+            except Exception:
+                pass
+
+        try:
+            code_input.input("\n")
+            return True
+        except Exception:
+            self._log("error", "❌ 未找到验证按钮且回车提交失败")
+            return False
+
     def _submit_email_by_input(self, page, email: str) -> bool:
-        """页面输入邮箱并点击“使用邮箱登录”入口。"""
+        """页面输入邮箱并点击“继续”入口。"""
         input_selectors = self._selector_values("email_input_selectors", [
             "css:input#email-input",
             "css:input[name='loginHint']",
             "css:input[jsname='YPqjbf']",
+            "css:input[aria-label*='工作电子邮件地址' i]",
+            "css:input[placeholder*='工作电子邮件地址' i]",
+            "css:input[aria-label*='work email' i]",
+            "css:input[placeholder*='work email' i]",
             "css:input[type='email']",
             "css:input[autocomplete='username']",
             "css:input[name='identifier']",
             "css:input[name='email']",
         ])
         use_email_keywords = self._selector_values("email_submit_button_keywords", [
+            "继续",
+            "continue",
+            "下一步",
+            "next",
+            "使用邮箱继续",
             "使用邮箱登录",
             "通过电子邮件登录",
             "通过电子邮件发送验证码",
@@ -676,15 +770,13 @@ class GeminiAutomation:
             "sign in with email",
             "use email",
             "continue with email",
-            "next",
-            "继续",
-            "下一步",
         ])
         clickable_selectors = self._selector_values("generic_clickable_selectors", ["tag:button", "tag:a", "css:[role='button']", "css:div[role='button']"])
         preferred_submit_selectors = self._selector_values("email_submit_button_selectors", [
             "css:button#log-in-button",
             "css:button[jsname='jXw9Fb']",
             "css:button[aria-label='使用邮箱继续']",
+            "css:button[aria-label='继续']",
         ])
 
         # 最多尝试 3 轮，兼容页面慢加载
@@ -1224,11 +1316,21 @@ class GeminiAutomation:
     def _find_verify_button(self, page):
         """查找验证按钮（排除重新发送按钮）"""
         try:
+            verify_keywords = ("验证", "verify", "继续", "continue", "下一步", "next")
             buttons = page.eles("tag:button")
+            fallback_btn = None
             for btn in buttons:
                 text = (btn.text or "").strip().lower()
-                if text and "重新" not in text and "发送" not in text and "resend" not in text and "send" not in text:
+                if not text:
+                    continue
+                if any(blocked in text for blocked in ("重新", "发送", "resend", "send")):
+                    continue
+                if any(keyword in text for keyword in verify_keywords):
                     return btn
+                if fallback_btn is None:
+                    fallback_btn = btn
+            if fallback_btn:
+                return fallback_btn
         except Exception:
             pass
         return None
